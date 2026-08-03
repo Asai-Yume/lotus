@@ -15,3 +15,16 @@ test_env/
 .cursor
 
 qdrant_storage/
+
+# datasets
+data/
+
+# output artifacts
+outputs/
+skill_index/
+
+# running batch files
+*.bat
+
+# api key
+openrouter.key

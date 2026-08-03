@@ -4,8 +4,13 @@ import lotus
 from lotus.models import LM, LiteLLMRM
 from lotus.vector_store import FaissVS
 
-lm = LM(model="gpt-4o-mini")
-rm = LiteLLMRM(model="text-embedding-3-small")
+import os
+
+if not os.getenv("OPENROUTER_API_KEY"):
+    raise RuntimeError("OPENROUTER_API_KEY is not set")
+
+lm = LM(model="openrouter/openai/gpt-5-mini")
+rm = LiteLLMRM(model="openrouter/openai/text-embedding-3-small")
 vs = FaissVS()
 
 lotus.settings.configure(lm=lm, rm=rm, vs=vs)

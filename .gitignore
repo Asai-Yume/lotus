@@ -1,4 +1,5 @@
 __pycache__/
+*.pyc
 .ipynb_checkpoints
 *.egg-info
 *.log
@@ -25,6 +26,8 @@ skill_index/
 
 # running batch files
 *.bat
+# ...but commit the Top-1 + LLM-Verify reproducibility launchers
+!scripts/run_top1_llm_verify_*.bat
 
 # api key
 openrouter.key

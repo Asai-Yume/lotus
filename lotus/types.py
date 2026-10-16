@@ -28,6 +28,8 @@ class LMStats:
         cached_prompt_tokens: int = 0
         # Tokens used to create the cache (prompt cache writes) - one-time cost
         cache_creation_tokens: int = 0
+        # Hidden reasoning tokens (o-series / gpt-5) spent from the completion budget
+        reasoning_tokens: int = 0
 
         def __sub__(self, other: "LMStats.TotalUsage") -> "LMStats.TotalUsage":
             return LMStats.TotalUsage(
@@ -37,6 +39,7 @@ class LMStats:
                 total_cost=self.total_cost - other.total_cost,
                 cached_prompt_tokens=self.cached_prompt_tokens - other.cached_prompt_tokens,
                 cache_creation_tokens=self.cache_creation_tokens - other.cache_creation_tokens,
+                reasoning_tokens=self.reasoning_tokens - other.reasoning_tokens,
             )
 
         def __add__(self, other: "LMStats.TotalUsage") -> "LMStats.TotalUsage":
@@ -47,6 +50,7 @@ class LMStats:
                 total_cost=self.total_cost + other.total_cost,
                 cached_prompt_tokens=self.cached_prompt_tokens + other.cached_prompt_tokens,
                 cache_creation_tokens=self.cache_creation_tokens + other.cache_creation_tokens,
+                reasoning_tokens=self.reasoning_tokens + other.reasoning_tokens,
             )
 
     # Usage stats if there was no caching
@@ -56,6 +60,14 @@ class LMStats:
 
     cache_hits: int = 0
     operator_cache_hits: int = 0
+    # Provider request items actually dispatched (cache hits do not count).
+    physical_requests: int = 0
+    # Additional provider request items after the first attempt for a logical prompt.
+    retry_attempts: int = 0
+    # Individual physical outcomes classified RETRYABLE.
+    retryable_failures: int = 0
+    # Individual physical outcomes classified FATAL.
+    fatal_failures: int = 0
 
     def __add__(self, other: "LMStats") -> "LMStats":
         return LMStats(
@@ -63,6 +75,10 @@ class LMStats:
             physical_usage=self.physical_usage + other.physical_usage,
             cache_hits=self.cache_hits + other.cache_hits,
             operator_cache_hits=self.operator_cache_hits + other.operator_cache_hits,
+            physical_requests=self.physical_requests + other.physical_requests,
+            retry_attempts=self.retry_attempts + other.retry_attempts,
+            retryable_failures=self.retryable_failures + other.retryable_failures,
+            fatal_failures=self.fatal_failures + other.fatal_failures,
         )
 
 
@@ -276,6 +292,30 @@ class LotusUsageLimitException(LotusException):
     """Exception raised when the usage limit is exceeded."""
 
     pass
+
+
+class LotusRetryExhaustedError(LotusException):
+    """Raised when a logical request keeps failing with retryable outcomes.
+
+    Carries diagnostic information (attempt count, request hash, model, and a
+    short description of the last outcome) without embedding the full prompt or
+    API-key material.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        attempts: int | None = None,
+        hash: str | None = None,
+        model: str | None = None,
+        last_error: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.attempts = attempts
+        self.hash = hash
+        self.model = model
+        self.last_error = last_error
 
 
 ################################################################################

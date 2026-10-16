@@ -35,6 +35,7 @@ from lotus.types import (
     LMStats,
     LogprobsForCascade,
     LogprobsForFilterCascade,
+    LotusRetryExhaustedError,
     LotusUsageLimitException,
     UsageLimit,
 )
@@ -77,6 +78,117 @@ if getattr(warnings.showwarning, "__name__", "") != "_drop_pydantic_serializer_w
 DEFAULT_MAX_TOKENS = 512
 DEFAULT_REASONING_MAX_TOKENS = 8192
 
+# HTTP status codes treated as transient provider failures when no stronger
+# structural signal (exception class / provider error metadata) is available.
+_RETRYABLE_STATUS_CODES = frozenset({408, 409, 425, 429, 500, 502, 503, 504, 529})
+
+# Provider error types (OpenRouter `error.metadata.error_type`) treated as transient.
+_RETRYABLE_PROVIDER_ERROR_TYPES = frozenset(
+    {
+        "provider_unavailable",
+        "upstream_error",
+        "stream_error",
+        "bad_gateway",
+        "service_unavailable",
+        "timeout",
+        "rate_limited",
+        "internal_error",
+    }
+)
+
+
+def _exception_status_code(exc: BaseException) -> int | None:
+    """Best-effort extraction of an HTTP status code from a provider exception."""
+    try:
+        status = getattr(exc, "status_code", None)
+    except Exception:
+        status = None
+    if status is None:
+        try:
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+        except Exception:
+            status = None
+    try:
+        return int(status) if status is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def is_retryable_exception(exc: BaseException) -> bool:
+    """Structural, class-first classification of a provider exception.
+
+    Returns True for transient provider/network failures that are safe to retry
+    (bounded by the caller's max_retries), False for permanent
+    authorization/billing/configuration failures. This deliberately avoids
+    free-text substring matching; status codes are only a fallback for
+    exception classes litellm does not map.
+    """
+    from litellm.exceptions import (
+        APIConnectionError,
+        APIError,
+        AuthenticationError,
+        BadGatewayError,
+        BadRequestError,
+        BudgetExceededError,
+        ContentPolicyViolationError,
+        ContextWindowExceededError,
+        GuardrailRaisedException,
+        InternalServerError,
+        InvalidRequestError,
+        NotFoundError,
+        PermissionDeniedError,
+        RateLimitError,
+        ServiceUnavailableError,
+        Timeout,
+        UnprocessableEntityError,
+        UnsupportedParamsError,
+    )
+    import openai
+
+    # Transient classes first: they take precedence over generic status checks.
+    if isinstance(
+        exc,
+        (
+            Timeout,
+            RateLimitError,
+            ServiceUnavailableError,
+            BadGatewayError,
+            InternalServerError,
+            APIConnectionError,
+            APIError,
+            openai.APITimeoutError,
+            openai.APIConnectionError,
+            openai.RateLimitError,
+            openai.InternalServerError,
+        ),
+    ):
+        return True
+    # Permanent classes (defensive: several subclass openai.APIStatusError).
+    if isinstance(
+        exc,
+        (
+            AuthenticationError,
+            PermissionDeniedError,
+            BadRequestError,
+            NotFoundError,
+            UnprocessableEntityError,
+            InvalidRequestError,
+            ContextWindowExceededError,
+            ContentPolicyViolationError,
+            UnsupportedParamsError,
+            BudgetExceededError,
+            GuardrailRaisedException,
+        ),
+    ):
+        return False
+    status = _exception_status_code(exc)
+    if status is not None:
+        return status in _RETRYABLE_STATUS_CODES
+    # Unknown openai API errors without a status are transport-ish: bounded retry.
+    if isinstance(exc, openai.APIError):
+        return True
+    return False
+
 
 class LM:
     """
@@ -117,6 +229,9 @@ class LM:
         cache: Any = None,
         physical_usage_limit: UsageLimit = UsageLimit(),
         virtual_usage_limit: UsageLimit = UsageLimit(),
+        max_retries: int = 0,
+        retry_backoff_seconds: float = 2.0,
+        send_max_completion_tokens: bool = True,
         **kwargs: dict[str, Any],
     ):
         """
@@ -137,6 +252,15 @@ class LM:
             cache: Cache instance to use. Defaults to None.
             physical_usage_limit (UsageLimit): Physical usage limits for the model. Defaults to UsageLimit().
             virtual_usage_limit (UsageLimit): Virtual usage limits for the model. Defaults to UsageLimit().
+            max_retries (int): Number of retries for transient provider failures
+                after the first physical attempt (defaults to 0 = no retries).
+            retry_backoff_seconds (float): Base exponential backoff between retries
+                (capped at 30 seconds). Defaults to 2.0.
+            send_max_completion_tokens (bool): When False, omit the completion-budget
+                parameter (max_completion_tokens/tokens) from the API request entirely
+                rather than sending ``max_tokens``. Used to match providers/experiments
+                that do not specify an output budget. Defaults to True (unchanged
+                historical behaviour).
             **kwargs: Additional keyword arguments passed to the underlying LLM API.
         """
         self.model = model
@@ -159,10 +283,23 @@ class LM:
         self.tokenizer = tokenizer
         # Use max_completion_tokens - LiteLLM translates to max_tokens for older models automatically
         self.kwargs = dict(temperature=temperature, max_completion_tokens=max_tokens, **kwargs)
+        # Opt-in escape hatch: when False, __call__ omits every completion-budget
+        # parameter (max_completion_tokens / max_tokens / max_output_tokens) from
+        # the API request entirely, instead of transmitting self.max_tokens.
+        # Defaults to True so existing LOTUS behaviour is unchanged.
+        self.send_max_completion_tokens = send_max_completion_tokens
 
         self.stats: LMStats = LMStats()
         self.physical_usage_limit = physical_usage_limit
         self.virtual_usage_limit = virtual_usage_limit
+
+        if max_retries < 0:
+            raise ValueError("max_retries must be >= 0.")
+        if retry_backoff_seconds < 0:
+            raise ValueError("retry_backoff_seconds must be >= 0.")
+        self.max_retries = max_retries
+        self.retry_backoff_seconds = retry_backoff_seconds
+        self.retry_max_backoff_seconds = 30.0
 
         self.cache = cache if cache is not None else CacheFactory.create_default_cache()
 
@@ -175,23 +312,33 @@ class LM:
     ) -> LMOutput:
         all_kwargs = {**self.kwargs, **kwargs}
 
+        # Any-Join-aligned mode: omit the completion-budget parameter entirely
+        # (not set to None, which some SDKs would serialize). Applies to every
+        # spelling of the budget so no budget key reaches the API request.
+        if not self.send_max_completion_tokens:
+            for _budget_key in ("max_completion_tokens", "max_tokens", "max_output_tokens"):
+                all_kwargs.pop(_budget_key, None)
+
         # Set top_logprobs if logprobs requested
         if all_kwargs.get("logprobs", False):
             all_kwargs.setdefault("top_logprobs", 10)
 
         if lotus.settings.enable_cache:
-            # Check cache and separate cached and uncached messages
+            # Check cache and separate cached and uncached messages. Cached entries
+            # are re-validated: an invalid/poisoned entry (e.g. a persisted provider
+            # failure) is deleted and treated as a miss instead of being replayed.
             hashed_messages = [self._hash_messages(msg, all_kwargs) for msg in messages]
             cached_responses_raw = [self.cache.get(hash) for hash in hashed_messages]
-            # Filter out None values and ensure they are ModelResponse
             cached_responses: list[ModelResponse | None] = []
-            for resp in cached_responses_raw:
+            for hash, resp in zip(hashed_messages, cached_responses_raw):
                 if resp is None:
                     cached_responses.append(None)
-                elif isinstance(resp, ModelResponse):
+                elif isinstance(resp, ModelResponse) and self._classify_response(resp) == "valid":
                     cached_responses.append(resp)
                 else:
-                    # Skip invalid cached responses
+                    # Invalid cached response: purge it and treat the request as a miss.
+                    if resp is not None:
+                        self.cache.delete(hash)
                     cached_responses.append(None)
         else:
             hashed_messages = []
@@ -205,16 +352,12 @@ class LM:
 
         self.stats.cache_hits += len(messages) - len(uncached_data)
 
-        # Process uncached messages in batches
+        # Process uncached messages in batches. Statistics and cache insertion for
+        # fresh responses happen per-item inside the execution path, so a validated
+        # success is persisted immediately and a failed response is never cached.
         uncached_responses = self._process_uncached_messages(
             uncached_data, all_kwargs, show_progress_bar, progress_bar_desc
         )
-
-        # Add new responses to cache and update stats
-        for resp, (_, hash) in zip(uncached_responses, uncached_data):
-            self._update_stats(resp, is_cached=False)
-            if lotus.settings.enable_cache:
-                self._cache_response(resp, hash)
 
         # Update virtual stats for cached responses
         if lotus.settings.enable_cache:
@@ -286,23 +429,222 @@ class LM:
             bar_format="{l_bar}{bar} {n}/{total} LM calls [{elapsed}<{remaining}, {rate_fmt}{postfix}]",
         )
 
-        batch = [msg for msg, _ in uncached_data]
+        # (absolute_index, messages, hash) items preserve prompt-to-response
+        # correspondence across per-request retries.
+        items = [(idx, msg, hash) for idx, (msg, hash) in enumerate(uncached_data)]
 
-        if self.tpm_limit is not None:
-            uncached_responses = self._process_with_tpm_limiting(batch, all_kwargs, pbar)
-        elif self.rate_limit is not None:
-            uncached_responses = self._process_with_rate_limiting(batch, all_kwargs, pbar)
-        else:
-            uncached_responses = batch_completion(
-                self.model, batch, drop_params=True, max_workers=self.max_batch_size, **all_kwargs
-            )
-            pbar.update(total_calls)
-
-        pbar.close()
+        try:
+            if self.tpm_limit is not None:
+                uncached_responses = self._process_with_tpm_limiting(items, all_kwargs, pbar)
+            elif self.rate_limit is not None:
+                uncached_responses = self._process_with_rate_limiting(items, all_kwargs, pbar)
+            else:
+                uncached_responses = self._execute_batch(items, all_kwargs, pbar)
+        finally:
+            pbar.close()
         return uncached_responses
 
+    def _execute_batch(
+        self,
+        items: list[tuple[int, list[dict[str, str]], str]],
+        all_kwargs: dict[str, Any],
+        pbar: tqdm,
+    ) -> list[ModelResponse]:
+        """Execute one batch of (absolute_index, messages, hash) items.
+
+        Every physical outcome is independently classified:
+
+          VALID      → accounted, persisted to the cache immediately, completed
+          RETRYABLE  → any billed usage accounted, NOT cached, retried (bounded)
+          FATAL      → any billed usage accounted, NOT cached, raised after the
+                       remaining items of the current dispatch have been accounted
+
+        Returns responses in ascending absolute-index order.
+        """
+        pending = list(items)
+        done: dict[int, ModelResponse] = {}
+        attempt = 0
+        abort_error: BaseException | None = None
+
+        while pending:
+            next_pending: list[tuple[int, list[dict[str, str]], str]] = []
+            try:
+                responses = batch_completion(
+                    self.model,
+                    [msg for _, msg, _ in pending],
+                    drop_params=True,
+                    max_workers=min(self.max_batch_size, len(pending)),
+                    **all_kwargs,
+                )
+            except Exception as exc:
+                # Whole-batch failure (executor/provider-level raise rather than an
+                # in-place result object): retry the whole batch when transient.
+                if is_retryable_exception(exc):
+                    if attempt >= self.max_retries:
+                        raise self._build_retry_exhausted_error(exc, None, attempt + 1) from exc
+                    attempt += 1
+                    self.stats.retry_attempts += len(pending)
+                    self.stats.retryable_failures += len(pending)
+                    self._sleep_before_retry(attempt)
+                    continue
+                self.stats.fatal_failures += 1
+                raise
+
+            if len(responses) != len(pending):
+                raise RuntimeError(
+                    "LiteLLM batch_completion returned an unexpected number of responses: "
+                    f"expected {len(pending)}, got {len(responses)}."
+                )
+
+            for (abs_idx, msg, hash_key), resp in zip(pending, responses):
+                self.stats.physical_requests += 1
+                cls = self._classify_response(resp)
+                if cls == "valid":
+                    self._account_attempt(resp, hash_key, cache=True)
+                    done[abs_idx] = resp
+                    pbar.update(1)
+                elif cls == "retryable":
+                    self.stats.retryable_failures += 1
+                    self._account_attempt(resp, hash_key, cache=False)
+                    if abort_error is not None:
+                        continue  # aborting this dispatch; do not schedule more work
+                    if attempt >= self.max_retries:
+                        abort_error = self._build_retry_exhausted_error(resp, hash_key, attempt + 1)
+                        continue
+                    next_pending.append((abs_idx, msg, hash_key))
+                else:  # fatal
+                    self.stats.fatal_failures += 1
+                    self._account_attempt(resp, hash_key, cache=False)
+                    if abort_error is None:
+                        abort_error = self._build_fatal_error(resp)
+
+            if abort_error is not None:
+                raise abort_error
+
+            if next_pending:
+                attempt += 1
+                self.stats.retry_attempts += len(next_pending)
+                self._sleep_before_retry(attempt)
+                pending = next_pending
+            else:
+                pending = []
+
+        return [done[i] for i in sorted(done)]
+
+    def _classify_response(self, response: Any) -> str:
+        """Classify one batch_completion result.
+
+        Returns one of:
+          "valid"     — usable completion, safe to cache and return
+          "retryable" — transient provider failure (content=None plus provider
+                        error metadata, malformed payload, or a retryable exception)
+          "fatal"     — permanent failure (auth/billing/refusal/unknown object)
+        """
+        if isinstance(response, BaseException):
+            return "retryable" if is_retryable_exception(response) else "fatal"
+
+        if not isinstance(response, ModelResponse):
+            # Unknown internal/programming object: fail rather than retry blindly.
+            return "fatal"
+
+        try:
+            message = response.choices[0].message
+        except (IndexError, AttributeError):
+            # Provider payload without usable choices: transient provider glitch.
+            return "retryable"
+
+        if getattr(message, "refusal", None):
+            # Content-policy refusal: permanent, do not retry.
+            return "fatal"
+
+        content = message.content
+        if content is not None:
+            # Non-None content (including an empty string) follows native handling:
+            # the native pipeline only rejects `content is None`.
+            return "valid"
+
+        # content is None: usable only if there is no structural provider error.
+        psf = getattr(response, "provider_specific_fields", None)
+        if isinstance(psf, dict):
+            if psf.get("native_finish_reason") == "error":
+                return "retryable"
+            error = psf.get("error")
+            if isinstance(error, dict):
+                code = error.get("code")
+                if isinstance(code, int) and code in _RETRYABLE_STATUS_CODES:
+                    return "retryable"
+                metadata = error.get("metadata")
+                error_type = metadata.get("error_type") if isinstance(metadata, dict) else None
+                if isinstance(error_type, str) and error_type in _RETRYABLE_PROVIDER_ERROR_TYPES:
+                    return "retryable"
+        # Ambiguous content=None without refusal or provider error metadata: never
+        # cache; a bounded retry is safer than an immediate crash, and with
+        # max_retries=0 it raises after the first attempt (like native behavior).
+        return "retryable"
+
+    def _response_usage(self, response: Any) -> Any | None:
+        """Usage attached to a physical outcome, if any. Exceptions have none."""
+        if isinstance(response, BaseException):
+            return None
+        usage = getattr(response, "usage", None)
+        return usage if usage is not None else None
+
+    def _account_attempt(self, response: Any, hash: str, cache: bool) -> None:
+        """Account one physical outcome and optionally persist a validated success.
+
+        Billed usage is counted for every response that carries usage, including
+        retryable/fatal failures. Only validated successes are cached.
+        """
+        if self._response_usage(response) is not None:
+            self._update_stats(response, is_cached=False)
+        if cache and lotus.settings.enable_cache and hash != "no-cache":
+            self._cache_response(response, hash)
+
+    def _sleep_before_retry(self, attempt: int) -> None:
+        delay = min(
+            self.retry_max_backoff_seconds,
+            self.retry_backoff_seconds * (2 ** max(0, attempt - 1)),
+        )
+        time.sleep(delay)
+
+    @staticmethod
+    def _describe_outcome(outcome: Any) -> str:
+        """Short, sanitized description of a failed outcome (no full prompts/keys)."""
+        if isinstance(outcome, BaseException):
+            return f"{type(outcome).__name__}: {str(outcome)[:300]}"
+        if isinstance(outcome, ModelResponse):
+            try:
+                content = outcome.choices[0].message.content
+                finish_reason = outcome.choices[0].finish_reason
+            except Exception:
+                content, finish_reason = "<unavailable>", None
+            psf = getattr(outcome, "provider_specific_fields", None)
+            error = psf.get("error") if isinstance(psf, dict) else None
+            return f"ModelResponse(content={content!r}, provider_error={error}, finish_reason={finish_reason})"
+        return f"{type(outcome).__name__}: {str(outcome)[:300]}"
+
+    def _build_fatal_error(self, outcome: Any) -> BaseException:
+        if isinstance(outcome, BaseException):
+            return outcome
+        return ValueError(f"Unusable model response: {self._describe_outcome(outcome)}")
+
+    def _build_retry_exhausted_error(
+        self, outcome: Any, hash_key: str | None, attempts: int
+    ) -> LotusRetryExhaustedError:
+        description = self._describe_outcome(outcome)
+        return LotusRetryExhaustedError(
+            f"Logical model request still failing after {attempts} physical attempt(s): {description}",
+            attempts=attempts,
+            hash=hash_key,
+            model=self.model,
+            last_error=description,
+        )
+
     def _process_with_rate_limiting(
-        self, batch: list[list[dict[str, str]]], all_kwargs: dict[str, Any], pbar: tqdm
+        self,
+        items: list[tuple[int, list[dict[str, str]], str]],
+        all_kwargs: dict[str, Any],
+        pbar: tqdm,
     ) -> list[ModelResponse]:
         """
         Process messages with rate limiting applied.
@@ -311,7 +653,7 @@ class LM:
         by adding delays between batches to ensure the rate limit is not exceeded.
 
         Args:
-            batch: List of message lists to process.
+            items: List of (absolute_index, messages, hash) tuples to process.
             all_kwargs: Complete keyword arguments for the LLM API.
             pbar: Progress bar instance to update.
 
@@ -319,7 +661,7 @@ class LM:
             List of ModelResponse objects from the LLM API.
         """
         responses = []
-        num_batches = math.ceil(len(batch) / self.max_batch_size)
+        num_batches = math.ceil(len(items) / self.max_batch_size)
         # We know rate_limit is not None because we're in the rate limiting branch
         assert self.rate_limit is not None
         min_interval_per_request = 60 / self.rate_limit  # seconds per request
@@ -327,19 +669,16 @@ class LM:
         for i in range(num_batches):
             start_time = time.time()
             start_idx = i * self.max_batch_size
-            end_idx = min((i + 1) * self.max_batch_size, len(batch))
-            sub_batch = batch[start_idx:end_idx]
-            sub_responses = batch_completion(
-                self.model, sub_batch, drop_params=True, max_workers=self.max_batch_size, **all_kwargs
-            )
+            end_idx = min((i + 1) * self.max_batch_size, len(items))
+            sub_items = items[start_idx:end_idx]
+            sub_responses = self._execute_batch(sub_items, all_kwargs, pbar)
             responses.extend(sub_responses)
-            pbar.update(len(sub_batch))
             end_time = time.time()
             elapsed = end_time - start_time
 
             # Calculate required delay based on number of requests in this batch
             # Each request should be spaced by min_interval_per_request
-            required_time_for_batch = len(sub_batch) * min_interval_per_request
+            required_time_for_batch = len(sub_items) * min_interval_per_request
 
             # Only sleep if the batch was faster than the required time
             if i < num_batches - 1:  # Don't sleep after the last batch
@@ -355,14 +694,18 @@ class LM:
         return sum(tokens for _, tokens in self._token_usage_history)
 
     def _process_with_tpm_limiting(
-        self, batch: list[list[dict[str, str]]], all_kwargs: dict[str, Any], pbar: tqdm
+        self,
+        items: list[tuple[int, list[dict[str, str]], str]],
+        all_kwargs: dict[str, Any],
+        pbar: tqdm,
     ) -> list[ModelResponse]:
         assert self.tpm_limit is not None
         responses = []
         token_estimates = []
         max_allowed_tpm = int(self.tpm_limit * 0.95)
 
-        for idx, msg in enumerate(batch):
+        for idx, item in enumerate(items):
+            msg = item[1]
             est = self.count_tokens(msg)
             total_est = est + self.max_tokens
 
@@ -376,50 +719,47 @@ class LM:
             token_estimates.append(est)
 
         i = 0
-        while i < len(batch):
+        while i < len(items):
             tokens_in_last_minute = self._get_tokens_used_in_last_minute()
             # Use a 5% safety buffer to avoid tight boundary errors
             available_tokens = max(0, int(self.tpm_limit * 0.95) - tokens_in_last_minute)
 
             # Build sub-batch based on available tokens and optional rate (RPM) limit
-            sub_batch = []
+            sub_items = []
             sub_batch_estimate = 0
 
             # Determine max possible requests in this specific burst
             # based on self.max_batch_size AND optional self.rate_limit
             effective_max_batch = self.max_batch_size
 
-            while i < len(batch):
+            while i < len(items):
                 # Include max_tokens in estimate as buffer for the completion
                 est = token_estimates[i] + self.max_tokens
 
                 if sub_batch_estimate + est <= available_tokens:
-                    sub_batch.append(batch[i])
+                    sub_items.append(items[i])
                     sub_batch_estimate += est
                     i += 1
-                    if len(sub_batch) >= effective_max_batch:
+                    if len(sub_items) >= effective_max_batch:
                         break
                 else:
                     # Row doesn't fit in current budget. Stop here.
                     break
 
-            if sub_batch:
+            if sub_items:
                 start_time = time.time()
-                sub_responses = batch_completion(
-                    self.model, sub_batch, drop_params=True, max_workers=len(sub_batch), **all_kwargs
-                )
+                sub_responses = self._execute_batch(sub_items, all_kwargs, pbar)
                 responses.extend(sub_responses)
 
                 # Record actual usage from response
                 actual_tokens = sum(r.usage.total_tokens for r in sub_responses if hasattr(r, "usage"))
                 self._token_usage_history.append((start_time, actual_tokens))
-                pbar.update(len(sub_batch))
 
                 # IF rate_limit is set, we must also enforce the RPM-based delay
                 # to prevent hitting RPM limits with many small requests.
                 if self.rate_limit is not None:
                     elapsed = time.time() - start_time
-                    required_time_for_rpm = len(sub_batch) * (60 / self.rate_limit)
+                    required_time_for_rpm = len(sub_items) * (60 / self.rate_limit)
                     to_sleep = required_time_for_rpm - elapsed
                     if to_sleep > 0:
                         time.sleep(to_sleep)
@@ -494,6 +834,45 @@ class LM:
                 usage.cached_prompt_tokens += cached_tokens
                 usage.cache_creation_tokens += cache_creation_tokens
 
+            # Extract hidden reasoning tokens (o-series / gpt-5) if provided.
+            completion_details = getattr(response.usage, "completion_tokens_details", None)
+            if completion_details:
+                if isinstance(completion_details, dict):
+                    reasoning_tokens = completion_details.get("reasoning_tokens", 0) or 0
+                else:
+                    reasoning_tokens = getattr(completion_details, "reasoning_tokens", 0) or 0
+                usage.reasoning_tokens += reasoning_tokens
+
+    def _response_cost(self, response: ModelResponse) -> float | None:
+        """Provider-billed cost when available, else LiteLLM's price calculation.
+
+        Preference order:
+          1. response.usage.cost_details.upstream_inference_cost (OpenRouter's
+             own billed figure; present even on partial/failed responses)
+          2. litellm.completion_cost via lotus.pricing (model price table)
+          3. None (existing no-pricing warning path)
+        The `usage.cost` field is deliberately not used: OpenRouter reports 0 there.
+        """
+        usage = getattr(response, "usage", None)
+        if usage is not None:
+            cost_details = getattr(usage, "cost_details", None)
+            if isinstance(cost_details, dict):
+                cost = cost_details.get("upstream_inference_cost")
+            else:
+                cost = (
+                    getattr(cost_details, "upstream_inference_cost", None)
+                    if cost_details is not None
+                    else None
+                )
+            if cost is not None:
+                try:
+                    cost = float(cost)
+                except (TypeError, ValueError):
+                    cost = None
+                if cost is not None and cost > 0:
+                    return cost
+        return calculate_cost_from_response(response)
+
     def _update_stats(self, response: ModelResponse, is_cached: bool = False):
         """
         Update usage statistics from a model response.
@@ -510,8 +889,8 @@ class LM:
         if not hasattr(response, "usage"):
             return
 
-        # Use LiteLLM's completion_cost (handles cached tokens automatically)
-        cost = calculate_cost_from_response(response)
+        # Use provider cost_details when available, else LiteLLM's completion_cost
+        cost = self._response_cost(response)
 
         if cost is not None:
             lotus.logger.debug(f"Calculated cost: ${cost:.6f} for model {self.model}")

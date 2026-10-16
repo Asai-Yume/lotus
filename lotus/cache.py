@@ -126,6 +126,11 @@ class Cache(ABC):
         pass
 
     @abstractmethod
+    def delete(self, key: str) -> None:
+        """Remove a key from the cache if present. Missing keys are a no-op."""
+        pass
+
+    @abstractmethod
     def reset(self, max_size: int | None = None):
         pass
 
@@ -225,6 +230,10 @@ class SQLiteCache(Cache):
             )
             self._enforce_size_limit()
 
+    def delete(self, key: str) -> None:
+        with self._get_connection() as conn:
+            conn.execute("DELETE FROM cache WHERE key = ?", (key,))
+
     def _enforce_size_limit(self):
         with self._get_connection() as conn:
             count = conn.execute("SELECT COUNT(*) FROM cache").fetchone()[0]
@@ -271,6 +280,9 @@ class InMemoryCache(Cache):
         # LRU eviction
         if len(self.cache) > self.max_size:
             self.cache.popitem(last=False)
+
+    def delete(self, key: str) -> None:
+        self.cache.pop(key, None)
 
     def reset(self, max_size: int | None = None):
         self.cache.clear()
@@ -328,6 +340,11 @@ class PickleFileCache(Cache):
         while len(self.cache) > self.max_size:
             self.cache.popitem(last=False)
         self._save_cache()
+
+    def delete(self, key: str) -> None:
+        if key in self.cache:
+            del self.cache[key]
+            self._save_cache()
 
     def reset(self, max_size: int | None = None):
         self.cache.clear()

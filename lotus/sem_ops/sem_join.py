@@ -421,6 +421,34 @@ def map_l1_to_l2(
     return out, mapped_col1_name
 
 
+def _classify_join_scores(
+    scores,
+    pos_threshold: float,
+    neg_threshold: float,
+) -> tuple[Any, int, Any]:
+    """Partition helper scores into mutually exclusive cascade categories.
+
+    Returns ``(high_mask, high_conf_neg, low_mask)`` with:
+
+      positive  = score >= pos_threshold            (accepted without oracle)
+      negative  = score < pos_threshold and score <= neg_threshold
+                                                   (rejected without oracle)
+      uncertain = neg_threshold < score < pos_threshold (sent to the oracle)
+
+    The three categories always partition the input, including the degenerate
+    ``pos_threshold == neg_threshold`` case where a score exactly at the
+    threshold belongs only to the positive category (matching the filter
+    cascade, which lets the positive action win at the boundary). When
+    ``pos_threshold > neg_threshold`` this is identical to the historical
+    ``score <= neg_threshold`` negative rule, so normal cascade behavior is
+    unchanged.
+    """
+    high_mask = scores >= pos_threshold
+    neg_mask = (scores < pos_threshold) & (scores <= neg_threshold)
+    low_mask = (scores < pos_threshold) & (scores > neg_threshold)
+    return high_mask, int(neg_mask.sum()), low_mask
+
+
 def join_optimizer(
     l1: pd.Series,
     l2: pd.Series,
@@ -496,9 +524,11 @@ def join_optimizer(
             )
             total_cost += learn_cost
 
-        high_conf = helper_join[helper_join["_scores"] >= pos_threshold]
-        high_conf_neg = len(helper_join[helper_join["_scores"] <= neg_threshold])
-        low_conf = helper_join[(helper_join["_scores"] < pos_threshold) & (helper_join["_scores"] > neg_threshold)]
+        high_mask, high_conf_neg, low_mask = _classify_join_scores(
+            helper_join["_scores"], pos_threshold, neg_threshold
+        )
+        high_conf = helper_join[high_mask]
+        low_conf = helper_join[low_mask]
 
         high_conf = high_conf.sort_values(by="_scores", ascending=False)
         low_conf = low_conf.sort_values(by="_scores", ascending=False)

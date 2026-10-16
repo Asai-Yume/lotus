@@ -43,6 +43,12 @@ class FamilyLayout:
     gt_target_candidates: tuple[str, ...]
 
 
+# Families whose ground truth and predictions are evaluated by *values* rather
+# than by physical row IDs. KBWT/SS tables are value-only; WT's evaluation is
+# value-based even though its tables carry extra metadata columns.
+VALUE_BASED_FAMILIES = frozenset({"kbwt", "ss", "wt"})
+
+
 FAMILY_LAYOUTS: dict[str, FamilyLayout] = {
     "autofj": FamilyLayout(
         source_filename="right.csv",
@@ -95,6 +101,63 @@ FAMILY_LAYOUTS: dict[str, FamilyLayout] = {
         ),
         gt_source_candidates=("source_id", "id_r", "source", "source_row_id"),
         gt_target_candidates=("target_id", "id_l", "target", "target_row_id"),
+    ),
+    "ss": FamilyLayout(
+        source_filename="source.csv",
+        target_filename="target.csv",
+        gt_filenames=(
+            "ground truth.csv",
+            "ground_truth.csv",
+            "ground-truth.csv",
+            "gt.csv",
+        ),
+        source_id_candidates=("source_id", "id", "row_id"),
+        source_value_candidates=("source_value", "value"),
+        target_id_candidates=("target_id", "id", "row_id"),
+        target_value_candidates=("target_value", "value"),
+        gt_source_candidates=("source_value", "source", "value"),
+        gt_target_candidates=("target_value", "target", "value"),
+    ),
+    "wt": FamilyLayout(
+        source_filename="source.csv",
+        target_filename="target.csv",
+        gt_filenames=(
+            "ground truth.csv",
+            "ground_truth.csv",
+            "ground-truth.csv",
+            "gt.csv",
+        ),
+        source_id_candidates=("source_id", "id", "row_id"),
+        source_value_candidates=(
+            "source_value",
+            "value",
+            "title",
+            "name",
+            "song",
+            "email",
+            "username",
+            "fullname",
+            "full name",
+            "city",
+            "state",
+            "president",
+            "governor",
+            "province",
+        ),
+        target_id_candidates=("target_id", "id", "row_id"),
+        target_value_candidates=(
+            "target_value",
+            "value",
+            "title",
+            "name",
+            "city",
+            "email",
+            "username",
+            "column 1",
+            "column_1",
+        ),
+        gt_source_candidates=("source_value", "source"),
+        gt_target_candidates=("target_value", "target"),
     ),
 }
 
@@ -569,9 +632,9 @@ def load_kbwt_dataset(
     layout: FamilyLayout,
     args: argparse.Namespace,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, ResolvedSchema]:
-    source_raw = pd.read_csv(source_path, dtype="string").reset_index(drop=True)
-    target_raw = pd.read_csv(target_path, dtype="string").reset_index(drop=True)
-    gt_raw = pd.read_csv(gt_path, dtype="string")
+    source_raw = pd.read_csv(source_path, dtype="string", keep_default_na=False).reset_index(drop=True)
+    target_raw = pd.read_csv(target_path, dtype="string", keep_default_na=False).reset_index(drop=True)
+    gt_raw = pd.read_csv(gt_path, dtype="string", keep_default_na=False)
 
     source_value_col = _resolve_kbwt_value_column(
         source_raw,
@@ -697,6 +760,269 @@ def load_kbwt_dataset(
     )
     return source, target, ground_truth, schema
 
+
+def _casefold_gt_prefix_matches(gt_columns: list[str], prefix: str) -> dict[str, str]:
+    """Map GT columns of the form '<prefix>-<suffix>' (casefold) to their suffixes."""
+    out: dict[str, str] = {}
+    for column in gt_columns:
+        cf = str(column).casefold()
+        if cf.startswith(prefix + "-"):
+            out[str(column)] = cf[len(prefix) + 1 :]
+    return out
+
+
+def _read_rows_txt_join_columns(dataset_dir: Path) -> tuple[str, str] | None:
+    """Read the canonical TabulaX/AutoFJ join-column mapping from rows.txt.
+
+    Line 1 is ``<source_col>:<target_col>``; line 2 is the direction
+    (``source`` means the first name is the source/query side). This is the
+    same file ``TabulaX/src/LLM_pipeline/util/dataset.py`` parses via
+    ``get_pairs_from_files``, so it is per-dataset config, not a heuristic.
+    Returns None when rows.txt is missing or unparseable.
+    """
+    rows_path = dataset_dir / "rows.txt"
+    if not rows_path.exists():
+        return None
+    try:
+        lines = rows_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    if not lines:
+        return None
+    parts = lines[0].strip().split(":")
+    if len(parts) < 2 or not parts[0].strip() or not parts[1].strip():
+        return None
+    source_col = parts[0].strip()
+    target_col = parts[1].strip()
+    if len(lines) > 1 and lines[1].strip().lower() == "target":
+        source_col, target_col = target_col, source_col
+    return source_col, target_col
+
+
+def _wt_value_column(
+    df: pd.DataFrame,
+    explicit: str | None,
+    candidates: Iterable[str],
+    *,
+    gt_columns: list[str],
+    prefix: str,
+    role: str,
+    rows_txt_col: str | None = None,
+) -> str:
+    """Resolve the join-value column of one WT table.
+
+    Order: explicit flag -> rows.txt column (authoritative per-dataset config,
+    validated to exist) -> single-column table -> ground-truth
+    ``<prefix>-<column>`` suffix match (must be unique) -> casefold candidate
+    match. WT metadata columns frequently share names with generic candidates
+    (e.g. ``State``, ``Party``) and the true join columns can have zero string
+    overlap with their counterparts (e.g. ``Governor's Name`` vs ``Name``), so
+    ambiguous multi-match cases are never guessed: they raise with the list of
+    candidate columns and the flags needed to resolve them.
+    """
+    if explicit:
+        if explicit not in df.columns:
+            raise DatasetSchemaError(
+                f"{role} column {explicit!r} was not found. "
+                f"Available columns: {df.columns.tolist()}"
+            )
+        return explicit
+    if rows_txt_col is not None:
+        match = _casefold_column_lookup(df, rows_txt_col)
+        if match is not None:
+            return match
+        raise DatasetSchemaError(
+            f"{role} column {rows_txt_col!r} from rows.txt was not found. "
+            f"Available columns: {df.columns.tolist()}"
+        )
+    if len(df.columns) == 1:
+        return str(df.columns[0])
+    prefixed = _casefold_gt_prefix_matches(gt_columns, prefix)
+    suffix_set = set(prefixed.values())
+    matches = [str(col) for col in df.columns if str(col).casefold() in suffix_set]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise DatasetSchemaError(
+            f"Ambiguous {role} value column for WT: {matches}. Ground-truth "
+            f"columns: {gt_columns}. Provide the corresponding "
+            "--source-value-col/--target-value-col option explicitly."
+        )
+    for candidate in candidates:
+        match = _casefold_column_lookup(df, candidate)
+        if match is not None:
+            return match
+    raise DatasetSchemaError(
+        f"Could not resolve {role} value column for WT. Available columns: "
+        f"{df.columns.tolist()}. Ground-truth columns: {gt_columns}. "
+        "Provide the corresponding --*-value-col option explicitly."
+    )
+
+
+def _wt_gt_column(
+    gt_raw: pd.DataFrame,
+    explicit: str | None,
+    value_column: str,
+    prefix: str,
+    role: str,
+) -> str:
+    """Find the GT column ``<prefix>-<value_column>`` (casefold) or validate an explicit one."""
+    if explicit:
+        if explicit not in gt_raw.columns:
+            raise DatasetSchemaError(
+                f"Ground-truth {role} column {explicit!r} was not found. "
+                f"Available columns: {gt_raw.columns.tolist()}"
+            )
+        return explicit
+    wanted = (prefix + "-" + value_column).casefold()
+    for column in gt_raw.columns:
+        if str(column).casefold() == wanted:
+            return str(column)
+    raise DatasetSchemaError(
+        f"Could not find ground-truth {role} column '{prefix}-{value_column}' for "
+        f"resolved value column {value_column!r}. Available GT columns: "
+        f"{gt_raw.columns.tolist()}. Provide --gt-source-col/--gt-target-col."
+    )
+
+
+def _drop_empty_join_rows(
+    df: pd.DataFrame,
+    value_column: str,
+    *,
+    role: str,
+) -> pd.DataFrame:
+    """Drop rows whose join value is empty; reset the index afterwards.
+
+    Only called for WT tables, whose scraped source/target files occasionally
+    contain trailing rows with no join value. Those rows cannot participate in
+    any join and are never referenced by the ground truth (GT values are
+    validated non-empty by the caller), so dropping them does not change the
+    evaluation surface. ``__index__`` row IDs stay contiguous because the index
+    is reset after filtering.
+    """
+    values = df[value_column].astype("string").fillna("").str.strip()
+    empty = values.eq("")
+    if empty.any():
+        print(
+            f"[{role}] Dropping {int(empty.sum())} row(s) with empty join value "
+            f"from column {value_column!r}."
+        )
+        return df.loc[~empty].reset_index(drop=True)
+    return df
+
+
+def load_wt_dataset(
+    *,
+    source_path: Path,
+    target_path: Path,
+    gt_path: Path,
+    layout: FamilyLayout,
+    args: argparse.Namespace,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, ResolvedSchema]:
+    """Load a WT (web-table) dataset with dataset-specific column schemas.
+
+    WT tables carry arbitrary metadata columns; the join-value column on each
+    side is resolved from explicit flags, a single-column table, a unique
+    ground-truth ``<side>-<column>`` prefix match, or a casefold candidate
+    match. Ambiguous multi-match tables must be resolved with explicit flags —
+    they are never guessed. IDs default to synthetic zero-based row positions;
+    evaluation is value-based.
+    """
+    source_raw = pd.read_csv(source_path, dtype="string", keep_default_na=False).reset_index(drop=True)
+    target_raw = pd.read_csv(target_path, dtype="string", keep_default_na=False).reset_index(drop=True)
+    gt_raw = pd.read_csv(gt_path, dtype="string", keep_default_na=False)
+    gt_columns = [str(column) for column in gt_raw.columns]
+
+    rows_txt = _read_rows_txt_join_columns(source_path.parent)
+    rows_txt_source = rows_txt[0] if rows_txt is not None else None
+    rows_txt_target = rows_txt[1] if rows_txt is not None else None
+
+    source_value_col = _wt_value_column(
+        source_raw,
+        args.source_value_col,
+        layout.source_value_candidates,
+        gt_columns=gt_columns,
+        prefix="source",
+        role="source join value",
+        rows_txt_col=rows_txt_source,
+    )
+    target_value_col = _wt_value_column(
+        target_raw,
+        args.target_value_col,
+        layout.target_value_candidates,
+        gt_columns=gt_columns,
+        prefix="target",
+        role="target join value",
+        rows_txt_col=rows_txt_target,
+    )
+
+    source_id_col, source_id_is_index = _resolve_kbwt_id_column(
+        source_raw,
+        args.source_id_col,
+        layout.source_id_candidates,
+        value_column=source_value_col,
+        role="source ID",
+    )
+    target_id_col, target_id_is_index = _resolve_kbwt_id_column(
+        target_raw,
+        args.target_id_col,
+        layout.target_id_candidates,
+        value_column=target_value_col,
+        role="target ID",
+    )
+
+    # WT tables are scraped web tables and occasionally carry trailing rows
+    # whose join value is empty (e.g. AJ-california-govs-2). Such rows cannot
+    # participate in any join, and the ground truth never references them —
+    # the GT values themselves are validated non-empty below. TabulaX evaluates
+    # GT pairs only (it never reads source.csv), and AutoFJ's conversion keeps
+    # these rows but they can never match a GT pair. Dropping them here avoids
+    # wasting retrieval/verification calls on unlabeled artifacts without
+    # changing any evaluation surface.
+    source_raw = _drop_empty_join_rows(source_raw, source_value_col, role="source")
+    target_raw = _drop_empty_join_rows(target_raw, target_value_col, role="target")
+
+    source_ids = prepare_id_series(source_raw, source_id_col, source_id_is_index, role="source ID")
+    target_ids = prepare_id_series(target_raw, target_id_col, target_id_is_index, role="target ID")
+    source_values = validate_text_values(source_raw[source_value_col], "source", source_value_col)
+    target_values = validate_text_values(target_raw[target_value_col], "target", target_value_col)
+
+    gt_source_col = _wt_gt_column(gt_raw, args.gt_source_col, source_value_col, "source", "source")
+    gt_target_col = _wt_gt_column(gt_raw, args.gt_target_col, target_value_col, "target", "target")
+    if gt_source_col == gt_target_col:
+        raise DatasetSchemaError("Ground-truth source and target columns cannot be the same.")
+
+    gt_source_values = validate_text_values(gt_raw[gt_source_col], "ground-truth source", gt_source_col)
+    gt_target_values = validate_text_values(gt_raw[gt_target_col], "ground-truth target", gt_target_col)
+
+    source = pd.DataFrame({"source_id": source_ids, "source_value": source_values})
+    target = pd.DataFrame({"target_id": target_ids, "target_value": target_values})
+    ground_truth = pd.DataFrame({"target_value": gt_target_values, "source_value": gt_source_values})
+
+    if source.empty:
+        raise DatasetSchemaError("The source/query table is empty.")
+    if target.empty:
+        raise DatasetSchemaError("The target/indexed table is empty.")
+    if not source["source_id"].is_unique:
+        raise DatasetSchemaError("Generated or supplied WT source IDs are not unique.")
+    if not target["target_id"].is_unique:
+        raise DatasetSchemaError("Generated or supplied WT target IDs are not unique.")
+
+    schema = ResolvedSchema(
+        source_file=str(source_path),
+        target_file=str(target_path),
+        ground_truth_file=str(gt_path),
+        source_id_col=source_id_col,
+        source_value_col=source_value_col,
+        target_id_col=target_id_col,
+        target_value_col=target_value_col,
+        gt_source_col=gt_source_col,
+        gt_target_col=gt_target_col,
+        source_id_is_index=source_id_is_index,
+        target_id_is_index=target_id_is_index,
+    )
+    return source, target, ground_truth, schema
+
 def load_dataset(
     dataset_dir: Path,
     family: str,
@@ -708,7 +1034,16 @@ def load_dataset(
     target_path = find_case_insensitive_file(dataset_dir, (layout.target_filename,))
     gt_path = find_case_insensitive_file(dataset_dir, layout.gt_filenames)
 
-    if family == "kbwt":
+    if family == "wt":
+        return load_wt_dataset(
+            source_path=source_path,
+            target_path=target_path,
+            gt_path=gt_path,
+            layout=layout,
+            args=args,
+        )
+
+    if family in VALUE_BASED_FAMILIES:
         return load_kbwt_dataset(
             source_path=source_path,
             target_path=target_path,
@@ -717,9 +1052,9 @@ def load_dataset(
             args=args,
         )
 
-    source_raw = pd.read_csv(source_path, dtype="string")
-    target_raw = pd.read_csv(target_path, dtype="string")
-    gt_raw = pd.read_csv(gt_path, dtype="string")
+    source_raw = pd.read_csv(source_path, dtype="string", keep_default_na=False)
+    target_raw = pd.read_csv(target_path, dtype="string", keep_default_na=False)
+    gt_raw = pd.read_csv(gt_path, dtype="string", keep_default_na=False)
 
     source_id_col, source_id_is_index = resolve_existing_column(
         source_raw,
@@ -836,9 +1171,9 @@ def load_dataset(
 
 
 def evaluation_pair_columns(family: str) -> tuple[str, str]:
-    # AutoFJ ground truth has stable row IDs. KBWT ground truth consists of
-    # source/target values, and duplicate values make row-ID mapping ambiguous.
-    if family == "kbwt":
+    # AutoFJ ground truth has stable row IDs. KBWT/SS/WT ground truth consists
+    # of source/target values, and duplicate values make row-ID mapping ambiguous.
+    if family in VALUE_BASED_FAMILIES:
         return "target_value", "source_value"
     return "target_id", "source_id"
 
@@ -896,7 +1231,7 @@ def evaluate_predictions(
     source_ids = _column_string_set(source, "source_id")
     predicted_source_ids = _column_string_set(predictions, "source_id")
 
-    if family == "kbwt":
+    if family in VALUE_BASED_FAMILIES:
         gt_source_values = _column_string_set(ground_truth, "source_value")
         matched_mask = source["source_value"].astype(str).isin(gt_source_values)
         gt_matched_source_ids = set(source.loc[matched_mask, "source_id"].astype(str))
@@ -964,7 +1299,7 @@ def run_one_dataset(
         "Evaluation pairs:    "
         + (
             "(target_value, source_value)"
-            if family == "kbwt"
+            if family in VALUE_BASED_FAMILIES
             else "(target_id, source_id)"
         )
     )
@@ -1216,8 +1551,33 @@ def discover_datasets(
 
 
 def write_summary(results: list[RunResult], path: Path) -> None:
+    """Write a family summary, merging with any existing summary file.
+
+    A family may be split across multiple runner invocations (e.g. the SS
+    batch runs 104 datasets first and then 4 datasets with explicit GT
+    columns). Each invocation writes its own rows; merging keeps every
+    completed dataset in the family summary instead of letting the last
+    invocation overwrite the earlier ones. Rows are deduplicated by
+    ``(family, dataset)`` and the newest result wins when a dataset is
+    deliberately rerun, so re-running never produces duplicate rows.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame([asdict(result) for result in results]).to_csv(path, index=False)
+    current = pd.DataFrame([asdict(result) for result in results])
+    if current.empty:
+        return
+
+    existing = pd.DataFrame()
+    if path.exists():
+        try:
+            existing = pd.read_csv(path)
+        except Exception:
+            existing = pd.DataFrame()
+
+    combined = pd.concat([existing, current], ignore_index=True)
+    key = [col for col in ("family", "dataset") if col in combined.columns]
+    if key:
+        combined = combined.drop_duplicates(subset=key, keep="last")
+    combined.to_csv(path, index=False)
 
 
 def build_parser(repo_root: Path) -> argparse.ArgumentParser:

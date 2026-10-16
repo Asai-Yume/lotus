@@ -486,7 +486,7 @@ def test_full_path_outputs_evaluation_accounting(monkeypatch):
     assert set(cands["llm_verified"].tolist()) == {True, False}
     assert list(preds["source_id"]) == ["s0", "s2"]  # s1 rejected
 
-    # The six historical columns keep their exact order and values; the three
+    # The six historical columns keep their exact order and values; the four
     # metadata columns are appended at the output boundary.
     assert list(preds.columns) == [
         "target_id",
@@ -495,6 +495,7 @@ def test_full_path_outputs_evaluation_accounting(monkeypatch):
         "source_value",
         "similarity_score",
         "llm_verified",
+        "dataset",
         "llm_model",
         "target_column",
         "source_column",
@@ -503,6 +504,9 @@ def test_full_path_outputs_evaluation_accounting(monkeypatch):
     assert preds["target_value"].tolist() == ["a", "c"]
     assert preds["similarity_score"].tolist() == [0.99, 0.97]
     assert preds["llm_verified"].tolist() == [True, True]
+    # dataset is the same identifier the run result and metrics record.
+    assert preds["dataset"].tolist() == [dataset_dir.name, dataset_dir.name]
+    assert result.dataset == dataset_dir.name
     # Effective provider-request model (litellm strips the "openrouter/" prefix).
     assert preds["llm_model"].tolist() == ["openai/gpt-5-mini", "openai/gpt-5-mini"]
     assert preds["target_column"].tolist() == ["title", "title"]
@@ -650,7 +654,7 @@ def test_metadata_resolution_failure_still_writes_predictions(monkeypatch, caplo
     ds_out = output_root / "autofj" / dataset_dir.name
     preds = pd.read_csv(ds_out / "predictions.csv")
 
-    # Predicted rows are still written, with the full nine-column schema.
+    # Predicted rows are still written, with the full ten-column schema.
     assert list(preds.columns) == [
         "target_id",
         "target_value",
@@ -658,6 +662,7 @@ def test_metadata_resolution_failure_still_writes_predictions(monkeypatch, caplo
         "source_value",
         "similarity_score",
         "llm_verified",
+        "dataset",
         "llm_model",
         "target_column",
         "source_column",
@@ -670,6 +675,8 @@ def test_metadata_resolution_failure_still_writes_predictions(monkeypatch, caplo
     assert preds["source_value"].tolist() == ["A", "B"]
     assert preds["similarity_score"].tolist() == [0.99, 0.97]
     assert preds["llm_verified"].tolist() == [True, True]
+    # dataset is unaffected by the metadata-resolution failure.
+    assert preds["dataset"].tolist() == [dataset_dir.name, dataset_dir.name]
     # Only the model metadata is unavailable; it is blank, never the raw id.
     assert preds["llm_model"].isna().all()  # blank fields read back as NaN
     assert "openrouter/openai/gpt-5-mini" not in preds["llm_model"].astype(str).tolist()
@@ -787,6 +794,7 @@ def test_full_path_anyjoin_batch_outputs_schema(monkeypatch):
         "source_value",
         "similarity_score",
         "llm_verified",
+        "dataset",
         "llm_model",
         "target_column",
         "source_column",
@@ -794,6 +802,7 @@ def test_full_path_anyjoin_batch_outputs_schema(monkeypatch):
     assert len(preds) == 1
     assert preds.iloc[0]["target_id"] == "t0"
     assert preds.iloc[0]["source_value"] == "A"
+    assert preds.iloc[0]["dataset"] == dataset_dir.name
     assert preds.iloc[0]["llm_model"] == "openai/gpt-5-mini"
     assert preds.iloc[0]["target_column"] == "title"  # schema.target_value_col
     assert preds.iloc[0]["source_column"] == "name"  # schema.source_value_col
@@ -807,3 +816,256 @@ def test_full_path_anyjoin_batch_outputs_schema(monkeypatch):
 
     assert result.status == "success"
     assert result.verification_mode == "anyjoin_batch"
+
+
+# ---------------------------------------------------------------------------
+# dataset metadata column: every family, both verification modes
+# ---------------------------------------------------------------------------
+
+
+def _run_mocked_dataset(monkeypatch, *, family, verification_mode, verdicts,
+                        make_dataset, schema, source, target, ground_truth,
+                        candidates, prefix, resolver=None, lm_model=None):
+    """Run run_one_dataset with fully mocked externals and return (result, preds)."""
+    dataset_dir = make_dataset()
+    output_root = make_work_dir(f"out_{prefix}")
+
+    class _FakeLM:
+        stats = LMStats()
+
+        def __init__(self):
+            self.cache = type("C", (), {"reset": lambda self=None: None})()
+            self.model = lm_model or "openrouter/openai/gpt-5-mini"
+
+    class _FakeRM:
+        embedding_rm_invocations = 2
+        embedding_api_requests = 3
+        embedded_rows = 4
+        embedding_batches = 1
+
+    monkeypatch.setattr(
+        runner_module, "load_dataset",
+        lambda *a, **k: (source, target, ground_truth, schema),
+    )
+    monkeypatch.setattr(
+        runner_module, "configure_models", lambda args: (_FakeLM(), _FakeRM(), object())
+    )
+    monkeypatch.setattr(
+        runner_module, "retrieve_top1",
+        lambda s, t, i, a: (target, candidates.copy(), 0.1, 0.2),
+    )
+    monkeypatch.setattr(runner_module, "verify_candidates", lambda c, m, a: list(verdicts))
+    monkeypatch.setattr(
+        runner_module, "verify_candidates_batched",
+        lambda c, m, a: (
+            list(verdicts),
+            {
+                "verification_batches": 1,
+                "verification_pairs_verified": len(verdicts),
+                "verification_pairs_unresolved": 0,
+                "verification_malformed_responses": 0,
+                "verification_missing_ids": 0,
+                "verification_out_of_range_ids": 0,
+                "verification_duplicate_ids": 0,
+            },
+        ),
+    )
+    if resolver is not None:
+        monkeypatch.setattr(runner_module, "get_llm_provider", resolver)
+
+    result = runner_module.run_one_dataset(
+        repo_root=_REPO_ROOT,
+        family=family,
+        dataset_dir=dataset_dir,
+        args=_args(
+            output_root=output_root,
+            verification_mode=verification_mode,
+            verification_batch_size=100,
+            lm_model=lm_model or "openrouter/openai/gpt-5-mini",
+        ),
+        repository_commit=None,
+    )
+    preds_path = output_root / family / dataset_dir.name / "predictions.csv"
+    return result, pd.read_csv(preds_path), preds_path, dataset_dir, output_root
+
+
+def _family_case(family, source_value_col, target_value_col):
+    """Fixtures for one family: frames, ground truth and a fresh dataset dir."""
+    source = pd.DataFrame({"source_id": ["s0", "s1", "s2"], "source_value": ["A", "B", "C"]})
+    target = pd.DataFrame({"target_id": ["t0", "t1", "t2"], "target_value": ["a", "b", "c"]})
+    if family in ("kbwt", "ss", "wt"):
+        ground_truth = pd.DataFrame({"target_value": ["a"], "source_value": ["A"]})
+    else:
+        ground_truth = pd.DataFrame({"target_id": ["t0"], "source_id": ["s0"]})
+    candidates = pd.DataFrame(
+        {
+            "target_id": ["t0", "t1", "t2"],
+            "target_value": ["a", "b", "c"],
+            "source_id": ["s0", "s1", "s2"],
+            "source_value": ["A", "B", "C"],
+            "similarity_score": [0.99, 0.97, 0.95],
+        }
+    )
+    schema = ResolvedSchema(
+        source_file="source.csv",
+        target_file="target.csv",
+        ground_truth_file="ground truth.csv",
+        source_id_col="source_id",
+        source_value_col=source_value_col,
+        target_id_col="target_id",
+        target_value_col=target_value_col,
+        gt_source_col="source_value",
+        gt_target_col="target_value",
+        source_id_is_index=False,
+        target_id_is_index=False,
+    )
+    return source, target, ground_truth, candidates, schema
+
+
+FAMILY_CASES = [
+    ("autofj", "title", "title"),
+    ("autofj_overlap", "title", "title"),
+    ("kbwt", "airport code", "city"),
+    ("ss", "value", "value"),
+    ("wt", "fullname", "username"),
+]
+
+
+def _family_tmp_dir(family):
+    return lambda: make_work_dir(f"ds_{family}")
+
+
+@pytest.mark.parametrize("family,source_value_col,target_value_col", FAMILY_CASES)
+@pytest.mark.parametrize("verification_mode", ["sem_filter", "anyjoin_batch"])
+def test_dataset_column_all_families_both_modes(
+    monkeypatch, family, source_value_col, target_value_col, verification_mode
+):
+    """dataset is populated for every family and both verification modes."""
+    source, target, ground_truth, candidates, schema = _family_case(
+        family, source_value_col, target_value_col
+    )
+    result, preds, _, dataset_dir, _ = _run_mocked_dataset(
+        monkeypatch,
+        family=family,
+        verification_mode=verification_mode,
+        verdicts=[True, False, True],
+        make_dataset=_family_tmp_dir(family),
+        schema=schema,
+        source=source,
+        target=target,
+        ground_truth=ground_truth,
+        candidates=candidates,
+        prefix=f"{family}_{verification_mode}",
+    )
+
+    assert list(preds.columns) == [
+        "target_id",
+        "target_value",
+        "source_id",
+        "source_value",
+        "similarity_score",
+        "llm_verified",
+        "dataset",
+        "llm_model",
+        "target_column",
+        "source_column",
+    ]
+    # dataset carries the runner's own identifier, not the output path.
+    assert preds["dataset"].tolist() == [dataset_dir.name, dataset_dir.name]
+    assert result.dataset == dataset_dir.name
+    # Existing fields and evaluation are unaffected.
+    assert preds["source_id"].tolist() == ["s0", "s2"]
+    assert preds["similarity_score"].tolist() == [0.99, 0.95]
+    assert preds["target_column"].tolist() == [target_value_col] * 2
+    assert preds["source_column"].tolist() == [source_value_col] * 2
+    assert preds["llm_model"].tolist() == ["openai/gpt-5-mini"] * 2
+    assert result.status == "success"
+    assert result.accepted_pairs == 2
+    assert result.true_positives == 1
+
+
+def test_dataset_column_header_only_empty_output(monkeypatch):
+    """Zero accepted predictions still yields the ten-column header."""
+    source, target, ground_truth, candidates, schema = _family_case("ss", "value", "value")
+    result, preds, preds_path, _, _ = _run_mocked_dataset(
+        monkeypatch,
+        family="ss",
+        verification_mode="anyjoin_batch",
+        verdicts=[False, False, False],
+        make_dataset=_family_tmp_dir("ss_empty"),
+        schema=schema,
+        source=source,
+        target=target,
+        ground_truth=ground_truth,
+        candidates=candidates,
+        prefix="ss_empty",
+    )
+
+    assert len(preds) == 0
+    assert list(preds.columns) == [
+        "target_id",
+        "target_value",
+        "source_id",
+        "source_value",
+        "similarity_score",
+        "llm_verified",
+        "dataset",
+        "llm_model",
+        "target_column",
+        "source_column",
+    ]
+    lines = preds_path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    assert lines[0] == (
+        "target_id,target_value,source_id,source_value,similarity_score,"
+        "llm_verified,dataset,llm_model,target_column,source_column"
+    )
+    assert result.status == "success"
+    assert result.accepted_pairs == 0
+
+
+def test_dataset_column_survives_metadata_resolution_failure(monkeypatch, caplog):
+    """dataset is still written when the model-metadata resolver fails."""
+    def boom(model):
+        raise RuntimeError("resolver unavailable")
+
+    source, target, ground_truth, candidates, schema = _family_case("kbwt", "airport code", "city")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        with caplog.at_level(logging.WARNING):
+            result, preds, _, dataset_dir, _ = _run_mocked_dataset(
+                monkeypatch,
+                family="kbwt",
+                verification_mode="sem_filter",
+                verdicts=[True, True, True],
+                make_dataset=_family_tmp_dir("kbwt_fail"),
+                schema=schema,
+                source=source,
+                target=target,
+                ground_truth=ground_truth,
+                candidates=candidates,
+                prefix="kbwt_fail",
+                resolver=boom,
+            )
+
+    assert list(preds.columns) == [
+        "target_id",
+        "target_value",
+        "source_id",
+        "source_value",
+        "similarity_score",
+        "llm_verified",
+        "dataset",
+        "llm_model",
+        "target_column",
+        "source_column",
+    ]
+    assert preds["dataset"].tolist() == [dataset_dir.name] * 3
+    assert preds["llm_model"].isna().all()
+    assert preds["source_id"].tolist() == ["s0", "s1", "s2"]
+    assert preds["similarity_score"].tolist() == [0.99, 0.97, 0.95]
+    assert result.status == "success"
+    assert any(
+        "Could not resolve provider-request model metadata" in record.message
+        for record in caplog.records
+    )

@@ -954,9 +954,11 @@ def run_one_dataset(
     )
     # Metadata columns appended at the output boundary, after filtering and
     # batch-provenance removal, so the six historical columns keep their exact
-    # order. llm_model is the effective provider-request model identifier that
-    # LiteLLM resolves for the configured LM; the column names come from the
-    # resolved schema and preserve original header spelling.
+    # order. ``dataset`` is the same identifier the run result and metrics use
+    # (the dataset directory name); llm_model is the effective provider-request
+    # model identifier that LiteLLM resolves for the configured LM; the column
+    # names come from the resolved schema and preserve original header spelling.
+    predictions["dataset"] = dataset
     predictions["llm_model"] = _effective_provider_model(lm.model)
     predictions["target_column"] = schema.target_value_col
     predictions["source_column"] = schema.source_value_col
